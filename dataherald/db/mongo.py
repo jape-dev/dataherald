@@ -13,7 +13,7 @@ class MongoDB(DB):
         super().__init__(system)
         db_uri = system.settings.require("db_uri")
         db_name = system.settings.require("db_name")
-        self._data_store = MongoClient(db_uri)[db_name]
+        self._data_store = MongoClient(db_uri, tz_aware=True)[db_name]
 
     @override
     def find_one(self, collection: str, query: dict) -> dict:
@@ -39,6 +39,8 @@ class MongoDB(DB):
     def update_or_create(self, collection: str, query: dict, obj: dict) -> int:
         row = self.find_one(collection, query)
         if row:
+            if "created_at" in obj:
+                del obj["created_at"]
             self._data_store[collection].update_one(query, {"$set": obj})
             return row["_id"]
         return self.insert_one(collection, obj)

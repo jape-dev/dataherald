@@ -1,7 +1,7 @@
 """Base class that all sql generation classes inherit from."""
+import os
 import re
 from abc import ABC, abstractmethod
-from datetime import date, datetime
 from typing import Any, List, Tuple
 
 import sqlparse
@@ -12,7 +12,7 @@ from dataherald.model.chat_model import ChatModel
 from dataherald.sql_database.base import SQLDatabase
 from dataherald.sql_database.models.types import DatabaseConnection
 from dataherald.sql_generator.create_sql_query_status import create_sql_query_status
-from dataherald.types import Question, Response, SQLQueryResult
+from dataherald.types import LLMConfig, Prompt, SQLGeneration
 from dataherald.utils.strings import contains_line_breaks
 
 
@@ -24,8 +24,9 @@ class SQLGenerator(Component, ABC):
     metadata: Any
     llm: ChatModel | None = None
 
-    def __init__(self, system: System):  # noqa: ARG002
+    def __init__(self, system: System, llm_config: LLMConfig):  # noqa: ARG002
         self.system = system
+        self.llm_config = llm_config
         self.model = ChatModel(self.system)
 
     def check_for_time_out_or_tool_limit(self, response: dict) -> dict:
@@ -38,23 +39,24 @@ class SQLGenerator(Component, ABC):
             )
         return response
 
+    def remove_markdown(self, query: str) -> str:
+        pattern = r"```sql(.*?)```"
+        matches = re.findall(pattern, query, re.DOTALL)
+        if matches:
+            return matches[0].strip()
+        return ""
+
+    @classmethod
+    def get_upper_bound_limit(cls) -> int:
+        top_k = os.getenv("UPPER_LIMIT_QUERY_RETURN_ROWS", None)
+        if top_k is None or top_k == "":
+            top_k = 50
+        return top_k if isinstance(top_k, int) else int(top_k)
+
     def create_sql_query_status(
-        self,
-        db: SQLDatabase,
-        query: str,
-        response: Response,
-        top_k: int = None,
-        generate_csv: bool = False,
-        database_connection: DatabaseConnection | None = None,
-    ) -> Response:
-        return create_sql_query_status(
-            db,
-            query,
-            response,
-            top_k,
-            generate_csv,
-            database_connection=database_connection,
-        )
+        self, db: SQLDatabase, query: str, sql_generation: SQLGeneration
+    ) -> SQLGeneration:
+        return create_sql_query_status(db, query, sql_generation)
 
     def format_intermediate_representations(
         self, intermediate_representation: List[Tuple[AgentAction, str]]
@@ -86,10 +88,9 @@ class SQLGenerator(Component, ABC):
     @abstractmethod
     def generate_response(
         self,
-        user_question: Question,
+        user_prompt: Prompt,
         database_connection: DatabaseConnection,
         context: List[dict] = None,
-        generate_csv: bool = False,
-    ) -> Response:
+    ) -> SQLGeneration:
         """Generates a response to a user question."""
         pass

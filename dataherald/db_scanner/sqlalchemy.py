@@ -1,11 +1,12 @@
+import logging
 from datetime import datetime
 from typing import Any, List
 
 import sqlalchemy
 from overrides import override
-from sqlalchemy import MetaData, inspect
+from sqlalchemy import Column, MetaData, Table, inspect
 from sqlalchemy.schema import CreateTable
-from sqlalchemy.sql import func
+from sqlalchemy.sql.sqltypes import NullType
 
 from dataherald.db_scanner import Scanner
 from dataherald.db_scanner.models.types import (
@@ -14,37 +15,101 @@ from dataherald.db_scanner.models.types import (
     TableDescriptionStatus,
 )
 from dataherald.db_scanner.repository.base import TableDescriptionRepository
+from dataherald.db_scanner.repository.query_history import QueryHistoryRepository
+from dataherald.db_scanner.services.abstract_scanner import AbstractScanner
+from dataherald.db_scanner.services.base_scanner import BaseScanner
+from dataherald.db_scanner.services.big_query_scanner import BigQueryScanner
+from dataherald.db_scanner.services.postgre_sql_scanner import PostgreSqlScanner
+from dataherald.db_scanner.services.snowflake_scanner import SnowflakeScanner
 from dataherald.sql_database.base import SQLDatabase
+from dataherald.types import ScannerRequest
 
 MIN_CATEGORY_VALUE = 1
 MAX_CATEGORY_VALUE = 60
 MAX_SIZE_LETTERS = 50
 
+logger = logging.getLogger(__name__)
+
 
 class SqlAlchemyScanner(Scanner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scanner_service: AbstractScanner = None
+
     @override
-    def synchronizing(
+    def create_tables(
         self,
-        tables: list[str],
+        sql_database: SQLDatabase,
         db_connection_id: str,
         repository: TableDescriptionRepository,
+        metadata: dict = None,
     ) -> None:
-        # persist tables to be scanned
+        tables = sql_database.get_tables_and_views()
         for table in tables:
             repository.save_table_info(
                 TableDescription(
                     db_connection_id=db_connection_id,
                     table_name=table,
-                    status=TableDescriptionStatus.SYNCHRONIZING.value,
+                    status=TableDescriptionStatus.NOT_SCANNED.value,
+                    metadata=metadata,
                 )
             )
 
     @override
-    def get_all_tables_and_views(self, database: SQLDatabase) -> list[str]:
-        inspector = inspect(database.engine)
-        meta = MetaData(bind=database.engine)
-        MetaData.reflect(meta, views=True)
-        return inspector.get_table_names() + inspector.get_view_names()
+    def refresh_tables(
+        self,
+        sql_database: SQLDatabase,
+        db_connection_id: str,
+        repository: TableDescriptionRepository,
+        metadata: dict = None,
+    ) -> list[TableDescription]:
+        stored_tables = repository.find_by({"db_connection_id": str(db_connection_id)})
+        stored_tables_list = [table.table_name for table in stored_tables]
+
+        source_tables = sql_database.get_tables_and_views()
+
+        rows = []
+        for table_description in stored_tables:
+            if table_description.table_name not in source_tables:
+                table_description.status = TableDescriptionStatus.DEPRECATED.value
+                rows.append(repository.save_table_info(table_description))
+            else:
+                rows.append(TableDescription(**table_description.dict()))
+
+        for table in source_tables:
+            if table not in stored_tables_list:
+                rows.append(
+                    repository.save_table_info(
+                        TableDescription(
+                            db_connection_id=db_connection_id,
+                            table_name=table,
+                            status=TableDescriptionStatus.NOT_SCANNED.value,
+                            metadata=metadata,
+                        )
+                    )
+                )
+        return rows
+
+    @override
+    def synchronizing(
+        self,
+        scanner_request: ScannerRequest,
+        repository: TableDescriptionRepository,
+    ) -> list[TableDescription]:
+        # persist tables to be scanned
+        rows = []
+        for table in scanner_request.table_names:
+            rows.append(
+                repository.save_table_info(
+                    TableDescription(
+                        db_connection_id=scanner_request.db_connection_id,
+                        table_name=table,
+                        status=TableDescriptionStatus.SYNCHRONIZING.value,
+                        metadata=scanner_request.metadata,
+                    )
+                )
+            )
+        return rows
 
     def get_table_examples(
         self, meta: MetaData, db_engine: SQLDatabase, table: str, rows_number: int = 3
@@ -81,6 +146,7 @@ class SqlAlchemyScanner(Scanner):
         ).limit(1)
 
         field_size = db_engine.engine.execute(field_size_query).first()
+        # Check if the column is empty
         if not field_size:
             field_size = [""]
         if len(str(str(field_size[0]))) > MAX_SIZE_LETTERS:
@@ -89,64 +155,15 @@ class SqlAlchemyScanner(Scanner):
                 data_type=str(column["type"]),
                 low_cardinality=False,
             )
-
-        # special case for PostgreSQL table - read query planner statistics from the pg_stats view
-        # TODO doesn't work for views, only tables
-        if db_engine.engine.driver == "psycopg2":
-            # TODO escape table and column names
-            rs = db_engine.engine.execute(
-                f"SELECT n_distinct, most_common_vals::TEXT::TEXT[] FROM pg_catalog.pg_stats WHERE tablename = '{table}' AND attname = '{column['name']}'"  # noqa: S608 E501
-            ).fetchall()
-            if (
-                len(rs) > 0
-                and MIN_CATEGORY_VALUE < rs[0]["n_distinct"] <= MAX_CATEGORY_VALUE
-            ):
-                return ColumnDetail(
-                    name=column["name"],
-                    data_type=str(column["type"]),
-                    low_cardinality=True,
-                    categories=rs[0]["most_common_vals"],
-                )
-            return ColumnDetail(
-                name=column["name"],
-                data_type=str(column["type"]),
-                low_cardinality=False,
-            )
-
-        try:
-            cardinality_query = sqlalchemy.select(
-                [func.distinct(dynamic_meta_table.c[column["name"]])]
-            ).limit(200)
-            cardinality = db_engine.engine.execute(cardinality_query).fetchall()
-        except Exception:
-            return ColumnDetail(
-                name=column["name"],
-                data_type=str(column["type"]),
-                low_cardinality=False,
-            )
-
-        if len(cardinality) > MAX_CATEGORY_VALUE:
-            return ColumnDetail(
-                name=column["name"],
-                data_type=str(column["type"]),
-                low_cardinality=False,
-            )
-
-        query = sqlalchemy.select(
-            [
-                dynamic_meta_table.c[column["name"]],
-                sqlalchemy.func.count(dynamic_meta_table.c[column["name"]]),
-            ]
-        ).group_by(dynamic_meta_table.c[column["name"]])
-
-        # get rows
-        categories = db_engine.engine.execute(query).fetchall()
-        if MIN_CATEGORY_VALUE < len(categories) <= MAX_CATEGORY_VALUE:
+        category_values = self.scanner_service.cardinality_values(
+            dynamic_meta_table.c[column["name"]], db_engine
+        )
+        if category_values:
             return ColumnDetail(
                 name=column["name"],
                 data_type=str(column["type"]),
                 low_cardinality=True,
-                categories=[str(category[0]) for category in categories],
+                categories=category_values,
             )
         return ColumnDetail(
             name=column["name"],
@@ -157,13 +174,26 @@ class SqlAlchemyScanner(Scanner):
     def get_table_schema(
         self, meta: MetaData, db_engine: SQLDatabase, table: str
     ) -> str:
-        print(f"Create table schema: {table}")
-        create_table = str(
-            CreateTable([x for x in meta.sorted_tables if x.name == table][0]).compile(
-                db_engine.engine
-            )
-        )
-        return f"{create_table.rstrip()}"
+        print(f"Create table schema for: {table}")
+
+        original_table = next((x for x in meta.sorted_tables if x.name == table), None)
+        if original_table is None:
+            raise ValueError(f"Table '{table}' not found in metadata.")
+
+        valid_columns = []
+        for col in original_table.columns:
+            if isinstance(col.type, NullType):
+                logger.warning(
+                    f"Column {col} is ignored due to its NullType data type which is not supported"
+                )
+                continue
+            valid_columns.append(col)
+
+        new_columns = [Column(col.name, col.type) for col in valid_columns]
+        new_table = Table(original_table.name, MetaData(), *new_columns)
+        create_table_ddl = str(CreateTable(new_table).compile(db_engine.engine))
+
+        return create_table_ddl.rstrip()
 
     def scan_single_table(
         self,
@@ -198,7 +228,8 @@ class SqlAlchemyScanner(Scanner):
                 meta=meta, db_engine=db_engine, table=table, rows_number=3
             ),
             last_schema_sync=datetime.now(),
-            status=TableDescriptionStatus.SYNCHRONIZED.value,
+            error_message="",
+            status=TableDescriptionStatus.SCANNED.value,
         )
 
         repository.save_table_info(object)
@@ -211,7 +242,17 @@ class SqlAlchemyScanner(Scanner):
         db_connection_id: str,
         table_names: list[str] | None,
         repository: TableDescriptionRepository,
+        query_history_repository: QueryHistoryRepository,
     ) -> None:
+        services = {
+            "snowflake": SnowflakeScanner,
+            "bigquery": BigQueryScanner,
+            "psycopg2": PostgreSqlScanner,
+        }
+        self.scanner_service = BaseScanner()
+        if db_engine.engine.driver in services.keys():
+            self.scanner_service = services[db_engine.engine.driver]()
+
         inspector = inspect(db_engine.engine)
         meta = MetaData(bind=db_engine.engine)
         MetaData.reflect(meta, views=True)
@@ -242,3 +283,14 @@ class SqlAlchemyScanner(Scanner):
                         error_message=f"{e}",
                     )
                 )
+            try:
+                logger.info(f"Get logs table: {table}")
+                query_history = self.scanner_service.get_logs(
+                    table, db_engine, db_connection_id
+                )
+                if len(query_history) > 0:
+                    for query in query_history:
+                        query_history_repository.insert(query)
+
+            except Exception:  # noqa: S112
+                continue

@@ -1,31 +1,33 @@
 import logging
-import os
 import re
 import time
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
-from bson.objectid import ObjectId
 from langchain.chains import LLMChain
 from langchain.prompts.chat import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
-    SystemMessagePromptTemplate,
 )
 from overrides import override
 from sql_metadata import Parser
+from sqlalchemy import text
 
 from dataherald.config import System
 from dataherald.db import DB
 from dataherald.db_scanner.models.types import TableDescriptionStatus
 from dataherald.db_scanner.repository.base import TableDescriptionRepository
 from dataherald.eval import Evaluation, Evaluator
-from dataherald.sql_database.base import SQLDatabase
+from dataherald.sql_database.base import SQLDatabase, SQLInjectionError
 from dataherald.sql_database.models.types import DatabaseConnection
-from dataherald.types import Question, Response
+from dataherald.types import Prompt, SQLGeneration
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_TEMPLATE = """You are a {dialect} expert.
+
+HUMAN_TEMPLATE = """
+You are a {dialect} expert.
 Given a question, a SQL query, and the database schema, analyze the correctness of the SQL query and provide a score.
 Score indicates how correctly and accurately SQL query answers the question.
 Note that the score should be between 0 and 100. Higher scores means the SQL Query is more accurate.
@@ -42,9 +44,6 @@ Double check the SQL query for the common mistakes, including:
 - columns in the SELECT clause should correspond to what exactly asked by user in the question
 - check for the improper use of the aggergation functions (SUM, AVG, MIN, MAX, ...)
 - robustness of the SQL query in handling cases where data values can be in different format (WHERE lower(column) = lower(entity))
-"""
-
-HUMAN_TEMPLATE = """
 Give me a score for the SQL query.
 Schema of the tables:
 {schema}
@@ -55,6 +54,7 @@ SQL Query: {SQL}
 SQL Query Result: {SQL_result}
 give me a one or two lines explanation and the score after 'Score: '.
 """
+TOP_K = 100
 
 
 class SimpleEvaluator(Evaluator):
@@ -85,57 +85,87 @@ class SimpleEvaluator(Evaluator):
     @override
     def evaluate(
         self,
-        question: Question,
-        generated_answer: Response,
+        user_prompt: Prompt,
+        sql_generation: SQLGeneration,
         database_connection: DatabaseConnection,
     ) -> Evaluation:
         database = SQLDatabase.get_sql_engine(database_connection)
         logger.info(
-            f"(Simple evaluator) Generating score for the question/sql pair: {str(question.question)}/ {str(generated_answer.sql_query)}"
+            f"(Simple evaluator) Generating score for the question/sql pair: {str(user_prompt.text)}/ {str(sql_generation.sql)}"
         )
         storage = self.system.instance(DB)
         repository = TableDescriptionRepository(storage)
         db_scan = repository.get_all_tables_by_db(
             {
-                "db_connection_id": ObjectId(database_connection.id),
-                "status": TableDescriptionStatus.SYNCHRONIZED.value,
+                "db_connection_id": str(database_connection.id),
+                "status": TableDescriptionStatus.SCANNED.value,
             }
         )
         self.llm = self.model.get_model(
             database_connection=database_connection,
             temperature=0,
-            model_name=os.getenv("LLM_MODEL", "gpt-4"),
+            model_name=self.llm_config.llm_name,
+            api_base=self.llm_config.api_base,
         )
         start_time = time.time()
-        system_message_prompt = SystemMessagePromptTemplate.from_template(
-            SYSTEM_TEMPLATE
-        )
         human_message_prompt = HumanMessagePromptTemplate.from_template(HUMAN_TEMPLATE)
-        chat_prompt = ChatPromptTemplate.from_messages(
-            [system_message_prompt, human_message_prompt]
-        )
-        user_question = question.question
-        sql = generated_answer.sql_query
+        chat_prompt = ChatPromptTemplate.from_messages([human_message_prompt])
+        user_question = user_prompt.text
+        sql = sql_generation.sql
         dialect = database.dialect
-        tables = Parser(sql).tables
+        try:
+            tables = Parser(sql).tables
+        except Exception as e:
+            logger.info(
+                f"(Simple evaluator) error while parsing the SQL query: {str(e)}. Returning score 0"
+            )
+            return Evaluation(
+                question_id=user_prompt.id, answer_id=sql_generation.id, score=0
+            )
         schema = ""
         for scanned_table in db_scan:
             if scanned_table.table_name in tables:
                 schema += f"Table: {scanned_table.table_schema}\n"
-        if generated_answer.sql_query_result is None:
+        if sql_generation.status == "INVALID":
             logger.info(
                 f"(Simple evaluator) SQL query: {sql} is not valid. Returning score 0"
             )
             return Evaluation(
-                question_id=question.id, answer_id=generated_answer.id, score=0
+                question_id=user_prompt.id, answer_id=sql_generation.id, score=0
             )
         chain = LLMChain(llm=self.llm, prompt=chat_prompt)
+        try:
+            query = database.parser_to_filter_commands(sql_generation.sql)
+            with database._engine.connect() as connection:
+                execution = connection.execute(text(query))
+                result = execution.fetchmany(TOP_K)
+            rows = []
+            for row in result:
+                modified_row = {}
+                for key, value in zip(row.keys(), row, strict=True):
+                    if type(value) in [
+                        date,
+                        datetime,
+                    ]:  # Check if the value is an instance of datetime.date
+                        modified_row[key] = str(value)
+                    elif (
+                        type(value) is Decimal
+                    ):  # Check if the value is an instance of decimal.Decimal
+                        modified_row[key] = float(value)
+                    else:
+                        modified_row[key] = value
+                rows.append(modified_row)
+
+        except SQLInjectionError as e:
+            raise SQLInjectionError(
+                "Sensitive SQL keyword detected in the query."
+            ) from e
         answer = chain.run(
             {
                 "dialect": dialect,
                 "question": user_question,
                 "SQL": sql,
-                "SQL_result": str(generated_answer.sql_query_result.json()),
+                "SQL_result": "\n".join([str(row) for row in rows]),
                 "schema": schema,
             }
         )
@@ -145,5 +175,5 @@ class SimpleEvaluator(Evaluator):
         end_time = time.time()
         logger.info(f"Evaluation time elapsed: {str(end_time - start_time)}")
         return Evaluation(
-            question_id=question.id, answer_id=generated_answer.id, score=score
+            question_id=user_prompt.id, answer_id=sql_generation.id, score=score
         )

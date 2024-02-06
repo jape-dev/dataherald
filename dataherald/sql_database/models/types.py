@@ -1,7 +1,8 @@
 import os
+from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, BaseSettings, Extra, validator
+from pydantic import BaseModel, BaseSettings, Extra, Field, validator
 
 from dataherald.utils.encrypt import FernetEncrypt
 
@@ -47,22 +48,16 @@ class FileStorage(BaseModel):
 
 
 class SSHSettings(BaseSettings):
-    db_name: str | None
     host: str | None
     username: str | None
     password: str | None
-    remote_host: str | None
-    remote_db_name: str | None
-    remote_db_password: str | None
+    port: str | None = "22"
     private_key_password: str | None
-    db_driver: str | None
 
     class Config:
         extra = Extra.ignore
 
-    @validator(
-        "password", "remote_db_password", "private_key_password", pre=True, always=True
-    )
+    @validator("password", "private_key_password", pre=True, always=True)
     def encrypt(cls, value: str):
         fernet_encrypt = FernetEncrypt()
         try:
@@ -79,21 +74,15 @@ class DatabaseConnection(BaseModel):
     id: str | None
     alias: str
     use_ssh: bool = False
-    uri: str | None
+    connection_uri: str | None
     path_to_credentials_file: str | None
     llm_api_key: str | None = None
     ssh_settings: SSHSettings | None = None
     file_storage: FileStorage | None = None
+    metadata: dict | None
+    created_at: datetime = Field(default_factory=datetime.now)
 
-    @validator("uri", pre=True, always=True)
-    def set_uri_without_ssh(cls, v, values):
-        if values["use_ssh"] and v:
-            raise ValueError("When use_ssh is True don't set uri")
-        if not values["use_ssh"] and not v:
-            raise ValueError("When use_ssh is False set uri")
-        return v
-
-    @validator("uri", "llm_api_key", pre=True, always=True)
+    @validator("connection_uri", "llm_api_key", pre=True, always=True)
     def encrypt(cls, value: str):
         fernet_encrypt = FernetEncrypt()
         try:
