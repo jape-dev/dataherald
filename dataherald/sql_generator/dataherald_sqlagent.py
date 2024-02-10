@@ -505,13 +505,13 @@ class SQLDatabaseToolkit(BaseToolkit):
             )
         get_current_datetime = SystemTime(db=self.db, context=self.context)
         tools.append(get_current_datetime)
-        tables_sql_db_tool = TablesSQLDatabaseTool(
-            db=self.db,
-            context=self.context,
-            db_scan=self.db_scan,
-            embedding=self.embedding,
-        )
-        tools.append(tables_sql_db_tool)
+        # tables_sql_db_tool = TablesSQLDatabaseTool(
+        #     db=self.db,
+        #     context=self.context,
+        #     db_scan=self.db_scan,
+        #     embedding=self.embedding,
+        # )
+        # tools.append(tables_sql_db_tool)
         schema_sql_db_tool = SchemaSQLDatabaseTool(
             db=self.db, context=self.context, db_scan=self.db_scan
         )
@@ -522,13 +522,13 @@ class SQLDatabaseToolkit(BaseToolkit):
         tools.append(info_relevant_tool)
         column_sample_tool = ColumnEntityChecker(db=self.db, context=self.context)
         tools.append(column_sample_tool)
-        if self.few_shot_examples is not None:
-            get_fewshot_examples_tool = GetFewShotExamples(
-                db=self.db,
-                context=self.context,
-                few_shot_examples=self.few_shot_examples,
-            )
-            tools.append(get_fewshot_examples_tool)
+        # if self.few_shot_examples is not None:
+        #     get_fewshot_examples_tool = GetFewShotExamples(
+        #         db=self.db,
+        #         context=self.context,
+        #         few_shot_examples=self.few_shot_examples,
+        #     )
+        #     tools.append(get_fewshot_examples_tool)
         return tools
 
 
