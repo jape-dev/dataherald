@@ -30,13 +30,13 @@ tip5) The Question/SQL pairs are labelled as correct pairs, so you can use them 
 tip6) If SQL results has None or NULL values, handle them by adding a WHERE clause to filter them out.
 """  # noqa: E501
 
-PLAN_WITH_INSTRUCTIONS = """1) Use the DbTablesWithRelevanceScores tool to find the a set of possibly relevant tables.
-2) Use the GetAdminInstructions tool to retrieve the DB admin instructions before calling other tools, to make sure you follow the instructions when writing the SQL query.
+PLAN_WITH_INSTRUCTIONS = """
+1) Use the GetAdminInstructions tool to retrieve the DB admin instructions before calling other tools, to make sure you follow the instructions when writing the SQL query.
 2) Use the DbRelevantTablesSchema tool to obtain the schema of possibly relevant tables to identify the possibly relevant columns.
-4) Use the DbRelevantColumnsInfo tool to gather more information about the possibly relevant columns, filtering them to find the relevant ones.
-5) [Optional based on the question] Use the SystemTime tool if the question has any mentions of time or dates.
-6) [Optional based on the question] Always use the DbColumnEntityChecker tool to make sure that relevant columns have the cell-values.
-7) Write a {dialect} query and use SqlDbQuery tool the Execute the SQL query on the database to check if the results are correct.
+3) Use the DbRelevantColumnsInfo tool to gather more information about the possibly relevant columns, filtering them to find the relevant ones.
+4) [Optional based on the question] Use the SystemTime tool if the question has any mentions of time or dates.
+5) [Optional based on the question] Always use the DbColumnEntityChecker tool to make sure that relevant columns have the cell-values.
+6) Write a {dialect} query and use SqlDbQuery tool the Execute the SQL query on the database to check if the results are correct.
 #
 Some tips to always keep in mind:
 tip1) If the SQL query resulted in errors or not correct results, rewrite the SQL query and try again.
