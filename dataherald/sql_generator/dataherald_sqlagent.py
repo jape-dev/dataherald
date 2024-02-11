@@ -505,13 +505,13 @@ class SQLDatabaseToolkit(BaseToolkit):
             )
         get_current_datetime = SystemTime(db=self.db, context=self.context)
         tools.append(get_current_datetime)
-        tables_sql_db_tool = TablesSQLDatabaseTool(
-            db=self.db,
-            context=self.context,
-            db_scan=self.db_scan,
-            embedding=self.embedding,
-        )
-        tools.append(tables_sql_db_tool)
+        # tables_sql_db_tool = TablesSQLDatabaseTool(
+        #     db=self.db,
+        #     context=self.context,
+        #     db_scan=self.db_scan,
+        #     embedding=self.embedding,
+        # )
+        # tools.append(tables_sql_db_tool)
         schema_sql_db_tool = SchemaSQLDatabaseTool(
             db=self.db, context=self.context, db_scan=self.db_scan
         )
